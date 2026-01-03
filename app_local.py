@@ -13,7 +13,7 @@ import threading
 
 # Page config
 st.set_page_config(
-    page_title="CrowdGuard.AI",
+    page_title="CrowdGuard",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -51,7 +51,7 @@ if 'last_detections' not in st.session_state:
     st.session_state.last_detections = []
 
 GRID_ROWS, GRID_COLS = 3, 3
-FRAME_SKIP = 2  # Process every 2nd frame for speed
+FRAME_SKIP = 3  # Process every 3rd frame for speed
 RESIZE_WIDTH = 640  # Resize frame for faster processing
 
 # Load YOLOv8 model with optimizations
@@ -411,30 +411,25 @@ def load_theme():
 load_theme()
 
 # Header
-col1, col2, col3 = st.columns([3, 1, 1])
+col1, col2 = st.columns([4, 1])
 
 with col1:
     if st.session_state.theme == 'dark':
         st.markdown("""
         <h1 style='margin:0; padding:0;'>
-            ⚡ CROWDGUARD<span style='color:#ec4899;'>.AI</span>
+            ⚡ CROWDGUARD
         </h1>
-        <p style='font-size:12px; color:#06b6d4; margin:0; letter-spacing:2px;'>&gt; NEURAL CROWD INTELLIGENCE SYSTEM</p>
+        <p style='font-size:12px; color:#06b6d4; margin:0; letter-spacing:2px;'>&gt; CROWD MONITORING SYSTEM</p>
         """, unsafe_allow_html=True)
     else:
         st.markdown("""
         <h1 style='margin:0; padding:0;'>
-            ⚡ CROWDGUARD<span style='color:#ec4899;'>.AI</span>
+            ⚡ CROWDGUARD
         </h1>
-        <p style='font-size:12px; color:#7c3aed; margin:0; letter-spacing:2px;'>&gt; NEURAL CROWD INTELLIGENCE SYSTEM</p>
+        <p style='font-size:12px; color:#7c3aed; margin:0; letter-spacing:2px;'>&gt; CROWD MONITORING SYSTEM</p>
         """, unsafe_allow_html=True)
 
 with col2:
-    if st.button("🌓 TOGGLE THEME", use_container_width=True):
-        st.session_state.theme = 'light' if st.session_state.theme == 'dark' else 'dark'
-        st.rerun()
-
-with col3:
     monitoring_label = "⏹️ STOP" if st.session_state.is_monitoring else "▶️ START"
     if st.button(monitoring_label, use_container_width=True, type="primary"):
         st.session_state.is_monitoring = not st.session_state.is_monitoring
@@ -444,7 +439,7 @@ with col3:
 st.markdown("---")
 
 # Horizontal Tabs
-tab1, tab2, tab3, tab4 = st.tabs(["📡 LIVE MONITOR", "📊 ANALYTICS", "🚨 INCIDENTS", "⚙️ SETTINGS"])
+tab1, tab2, tab3, tab4 = st.tabs(["⚙️ SETTINGS", "📡 LIVE MONITOR", "📊 ANALYTICS", "🚨 INCIDENTS"])
 
 # Helper Functions
 def get_zone_status(count, threshold):
@@ -473,8 +468,68 @@ def render_zone_grid(zone_data, threshold):
                 </div>
                 """, unsafe_allow_html=True)
 
-# TAB 1: LIVE MONITOR
+# TAB 1: SETTINGS
 with tab1:
+    st.markdown("### ⚙️ SYSTEM CONFIGURATION")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("#### 🎚️ DETECTION SETTINGS")
+        
+        alert_threshold = st.slider(
+            "Alert Threshold (per zone)",
+            min_value=1,
+            max_value=20,
+            value=5,
+            help="Number of people to trigger an alert"
+        )
+        st.session_state.alert_threshold = alert_threshold
+        
+        detection_confidence = st.slider(
+            "Detection Confidence",
+            min_value=0.1,
+            max_value=1.0,
+            value=0.5,
+            step=0.1
+        )
+        st.session_state.detection_confidence = detection_confidence
+        
+        show_boxes = st.checkbox("Show detection boxes", value=True)
+        st.session_state.show_boxes = show_boxes
+        
+        audio_alerts = st.checkbox("Enable audio alerts", value=True)
+    
+    with col2:
+        st.markdown("#### 🎨 DISPLAY SETTINGS")
+        
+        grid_size = st.selectbox("Grid Size", ["3x3", "4x4", "5x5"], index=0)
+        
+        frame_skip = st.slider(
+            "Frame Skip (higher = faster)",
+            min_value=1,
+            max_value=10,
+            value=3,
+            help="Process every Nth frame. Higher values = faster performance"
+        )
+        FRAME_SKIP = frame_skip
+        
+        st.markdown("#### 💾 DATA MANAGEMENT")
+        
+        if st.button("🗑️ CLEAR ALL DATA", use_container_width=True):
+            st.session_state.LOG = []
+            st.session_state.incidents = []
+            st.session_state.alerts = []
+            st.session_state.peak_count = 0
+            st.success("✅ All data cleared!")
+        
+        if st.button("🔄 RESET SYSTEM", use_container_width=True):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+
+# TAB 2: LIVE MONITOR
+with tab2:
     # KPI Metrics
     col1, col2, col3, col4 = st.columns(4)
     
@@ -585,9 +640,9 @@ with tab1:
 # Process Webcam
 if st.session_state.webcam_active:
     cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS, 15)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer
     
     if cap.isOpened():
@@ -607,7 +662,7 @@ if st.session_state.webcam_active:
                 small_h, small_w = small_frame.shape[:2]
                 
                 # Detect people on smaller frame
-                detection_conf = st.session_state.get('detection_confidence', 0.45)
+                detection_conf = st.session_state.get('detection_confidence', 0.4)
                 detections = detect_people(model, small_frame, conf=detection_conf)
                 
                 # Scale detections back to original frame size
@@ -765,8 +820,8 @@ if st.session_state.video_file is not None and not st.session_state.webcam_activ
     time.sleep(0.05)
     st.rerun()
 
-# TAB 2: ANALYTICS
-with tab2:
+# TAB 3: ANALYTICS
+with tab3:
     st.markdown("### 📊 CROWD ANALYTICS DASHBOARD")
     
     col1, col2 = st.columns(2)
@@ -855,8 +910,8 @@ with tab2:
         else:
             st.warning("⚠️ No data available to export")
 
-# TAB 3: INCIDENTS
-with tab3:
+# TAB 4: INCIDENTS
+with tab4:
     st.markdown("### 🚨 INCIDENT MANAGEMENT")
     
     col1, col2 = st.columns([3, 1])
@@ -932,73 +987,15 @@ with tab3:
     else:
         st.info("📋 No incidents reported yet")
 
-# TAB 4: SETTINGS
-with tab4:
-    st.markdown("### ⚙️ SYSTEM CONFIGURATION")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("#### 🎚️ DETECTION SETTINGS")
-        
-        alert_threshold = st.slider(
-            "Alert Threshold (per zone)",
-            min_value=1,
-            max_value=20,
-            value=5,
-            help="Number of people to trigger an alert"
-        )
-        st.session_state.alert_threshold = alert_threshold
-        
-        detection_confidence = st.slider(
-            "Detection Confidence",
-            min_value=0.1,
-            max_value=1.0,
-            value=0.5,
-            step=0.1
-        )
-        st.session_state.detection_confidence = detection_confidence
-        
-        show_boxes = st.checkbox("Show detection boxes", value=True)
-        st.session_state.show_boxes = show_boxes
-        
-        audio_alerts = st.checkbox("Enable audio alerts", value=True)
-    
-    with col2:
-        st.markdown("#### 🎨 DISPLAY SETTINGS")
-        
-        grid_size = st.selectbox("Grid Size", ["3x3", "4x4", "5x5"], index=0)
-        
-        frame_skip = st.slider(
-            "Frame Skip (higher = faster)",
-            min_value=1,
-            max_value=10,
-            value=3,
-            help="Process every Nth frame. Higher values = faster performance"
-        )
-        FRAME_SKIP = frame_skip
-        
-        st.markdown("#### 💾 DATA MANAGEMENT")
-        
-        if st.button("🗑️ CLEAR ALL DATA", use_container_width=True):
-            st.session_state.LOG = []
-            st.session_state.incidents = []
-            st.session_state.alerts = []
-            st.session_state.peak_count = 0
-            st.success("✅ All data cleared!")
-        
-        if st.button("🔄 RESET SYSTEM", use_container_width=True):
-            for key in list(st.session_state.keys()):
-                del st.session_state[key]
-            st.rerun()
+
 
 # Footer
 st.markdown("---")
 st.markdown(f"""
 <div style='text-align:center; padding:20px; opacity:0.7;'>
     <p style='margin:0; font-size:12px; letter-spacing:2px;'>
-        {'⚡' if st.session_state.theme == 'dark' else '🔮'} CROWDGUARD.AI v2.0 | 
-        POWERED BY YOLOV8 + NEURAL NETWORKS | 
+        {'⚡' if st.session_state.theme == 'dark' else '🔮'} CROWDGUARD v2.0 | 
+        POWERED BY YOLOV8 DETECTION | 
         {'DARK MODE' if st.session_state.theme == 'dark' else 'LIGHT MODE'} ACTIVE
     </p>
 </div>
