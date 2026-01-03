@@ -10,7 +10,7 @@ HIGH_THRESHOLD = 10
 DETECTION_CONFIDENCE = 0.5  # Not used directly unless passed to detect_people
 
 # Load YOLOv8n model
-model = YOLO("model/yolov8n.pt")
+model = YOLO("yolov8n.pt")
 
 # Initialize webcam (use CAP_DSHOW for Windows compatibility)
 cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)

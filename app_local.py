@@ -4,218 +4,222 @@ import numpy as np
 import pandas as pd
 import tempfile
 import time
-import matplotlib.pyplot as plt
-import seaborn as sns
-from ultralytics import YOLO
-import streamlit.components.v1 as components
-import os
-import base64
+import sqlite3
+import threading
+import queue
+import platform
 import pyttsx3
-import platform  # ✅ NEW: For OS detection
+from ultralytics import YOLO
 
+# Custom utils
 from utils import detect_people, get_zone_id, draw_zone_grid
 
+# ---------------- CONFIG ----------------
 GRID_ROWS, GRID_COLS = 3, 3
-model = YOLO("yolov8n.pt")
+FIXED_CONFIDENCE = 0.45
+MODEL_PATH = "yolov8n.pt"
+DB_NAME = "crowd_guard.db"
+FRAME_SKIP = 3  # Run AI every 3rd frame for speed
 
-# ✅ Updated speak() function to skip TTS on non-Windows (like Streamlit Cloud)
-def speak(text):
-    if platform.system() == "Windows":
+# ---------------- ASYNC DATABASE & AUDIO WORKER ----------------
+db_queue = queue.Queue()
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    c = conn.cursor()
+    # Log table (all zones)
+    c.execute('''CREATE TABLE IF NOT EXISTS logs 
+                 (timestamp TEXT, zone_0 INTEGER, zone_1 INTEGER, zone_2 INTEGER, 
+                  zone_3 INTEGER, zone_4 INTEGER, zone_5 INTEGER, 
+                  zone_6 INTEGER, zone_7 INTEGER, zone_8 INTEGER)''')
+    # Alert table
+    c.execute('''CREATE TABLE IF NOT EXISTS alerts 
+                 (timestamp TEXT, zone_id INTEGER, count INTEGER, message TEXT)''')
+    conn.commit()
+    conn.close()
+
+def db_worker():
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    c = conn.cursor()
+    while True:
         try:
-            engine = pyttsx3.init()
-            engine.setProperty('rate', 160)
-            engine.say(text)
-            engine.runAndWait()
-        except Exception as e:
-            print(f"Speech error: {e}")
-    else:
-        print(f"TTS skipped on non-Windows system: {text}")
+            task = db_queue.get()
+            if task is None: break
+            query, params = task
+            c.execute(query, params)
+            conn.commit()
+            db_queue.task_done()
+        except Exception:
+            pass
+    conn.close()
 
-st.set_page_config(page_title="CrowdGuardAI", layout="wide")
-st.title("🛡️ CrowdGuardAI - Real-Time Crowd Monitoring")
+# Start background thread
+init_db()
+threading.Thread(target=db_worker, daemon=True).start()
 
-# Init session state
-for key, val in {
-    "source_mode": None, "last_beep": 0, "LOG": [],
-    "peak_count": 0, "start_time": time.time(), "zone_beep_timers": {}
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = val
+def async_save_alert(zone_id, count, msg):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    db_queue.put(("INSERT INTO alerts VALUES (?, ?, ?, ?)", (ts, zone_id, count, msg)))
 
-# Sidebar controls
-st.sidebar.header("⚙️ Control Settings")
-alert_threshold = st.sidebar.slider("Overcrowding Alert Threshold (per zone)", 1, 50, 5)
-detection_confidence = st.sidebar.slider("Detection Confidence", 0.1, 1.0, 0.5)
+def async_save_log(zone_counts):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    db_queue.put(("INSERT INTO logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (ts, *zone_counts)))
 
-if st.sidebar.button("▶️ Start Webcam"):
-    st.session_state.source_mode = "webcam"
-if st.sidebar.button("⏹️ Stop Webcam"):
-    st.session_state.source_mode = None
-if st.sidebar.button("📁 Upload Video"):
-    st.session_state.source_mode = "video"
-if st.sidebar.button("💾 Export Logs"):
-    st.session_state.source_mode = "export"
-if st.sidebar.button("🔙 Back to Home"):
-    st.session_state.source_mode = None
+def get_recent_alerts(limit=10):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        df = pd.read_sql_query(f"SELECT * FROM alerts ORDER BY timestamp DESC LIMIT {limit}", conn)
+        conn.close()
+        return df
+    except:
+        return pd.DataFrame()
 
-FRAME_WINDOW = st.empty()
-
-# Display metrics
-def render_stats(current_total):
-    elapsed = time.time() - st.session_state.start_time
-    avg_density = np.mean([
-        sum([v for k, v in row.items() if k.startswith("Zone_")]) for row in st.session_state.LOG
-    ]) if st.session_state.LOG else 0
-
-    if current_total > st.session_state.peak_count:
-        st.session_state.peak_count = current_total
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("👥 Current", current_total)
-    col2.metric("📈 Peak", st.session_state.peak_count)
-    col3.metric("⏱️ Uptime", f"{int(elapsed)}s")
-    col4.metric("📊 Avg Density", f"{avg_density:.1f}")
-
-# Core processing loop
-
-def process_video(cap):
-    st.success("✅ Webcam connected! Monitoring started...")
-
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            st.warning("📴 Webcam disconnected.")
-            break
-
-        frame = cv2.flip(frame, 1)
-        frame_h, frame_w = frame.shape[:2]
-        zone_counts = [0] * (GRID_ROWS * GRID_COLS)
-        detections = detect_people(model, frame, conf=detection_confidence)
-        draw_zone_grid(frame, GRID_ROWS, GRID_COLS)
-
-        for det in detections:
-            x1, y1, x2, y2, conf = det
-            xc, yc = (x1 + x2) // 2, (y1 + y2) // 2
-            zone_id = get_zone_id(xc, yc, frame_w, frame_h, GRID_ROWS, GRID_COLS)
-            zone_counts[zone_id] += 1
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.circle(frame, (xc, yc), 3, (0, 0, 255), -1)
-
-        total = sum(zone_counts)
-        render_stats(total)
-
-        for i, count in enumerate(zone_counts):
-            if count >= alert_threshold:
-                cv2.putText(frame, f"Zone {i} OVERCROWDED!", (10, 30 + i * 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                last_time = st.session_state.zone_beep_timers.get(i, 0)
-                if time.time() - last_time > 3:
-                    if os.path.exists("Beep2.m4a"):
-                        with open("Beep2.m4a", "rb") as f:
-                            audio_base64 = base64.b64encode(f.read()).decode()
-                            components.html(f"""
-                            <audio autoplay>
-                            <source src=\"data:audio/mp3;base64,{audio_base64}\" type=\"audio/mp3\">
-                            </audio>
-                            """, height=0)
-                    speak(f"Alert! Overcrowding in zone {i}")
-                    st.session_state.zone_beep_timers[i] = time.time()
-
-        if total >= alert_threshold:
-            st.error(f"🚨 Total crowd too high: {total}")
+# ---------------- HELPER: ASYNC SPEECH ----------------
+def speak(text):
+    def _speak():
+        if platform.system() == "Windows":
+            try:
+                engine = pyttsx3.init()
+                engine.setProperty('rate', 160)
+                engine.say(text)
+                engine.runAndWait()
+            except: pass
         else:
-            st.success("🟢 Normal density")
+            print(f"🔊 {text}")
+    threading.Thread(target=_speak, daemon=True).start()
 
-        log_row = {"timestamp": time.strftime("%H:%M:%S")}
-        for i, c in enumerate(zone_counts):
-            log_row[f"Zone_{i}"] = c
-        st.session_state.LOG.append(log_row)
+# ---------------- MODEL ----------------
+@st.cache_resource
+def load_model():
+    return YOLO(MODEL_PATH)
 
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        FRAME_WINDOW.image(frame, width=640, channels="RGB")  # Reduced webcam size
-        time.sleep(0.03)
+model = load_model()
 
-    cap.release()
+# ---------------- UI LAYOUT ----------------
+st.set_page_config(page_title="CrowdGuardAI", layout="wide", page_icon="🛡️")
+st.title("🛡️ CrowdGuardAI - Monitor")
 
-# ------------------ MODES ------------------
-if st.session_state.source_mode is None:
-    st.markdown("""
-    This tool uses YOLOv8 for:
-    - ✅ Real-time people detection from webcam or video
-    - 🧶 Dynamic crowd density analysis using a 3x3 zone grid
-    - 🚨 Intelligent alerts with customizable thresholds and audio warnings
-    - 📈 Visual heatmaps (live, cumulative, average) and trend graphs
-    - 💾 Exportable CSV logs for analysis and record keeping
+# Session State
+if "source_mode" not in st.session_state: st.session_state.source_mode = None
+if "peak_count" not in st.session_state: st.session_state.peak_count = 0
+if "start_time" not in st.session_state: st.session_state.start_time = time.time()
+if "zone_beep_timers" not in st.session_state: st.session_state.zone_beep_timers = {}
+if "last_detections" not in st.session_state: st.session_state.last_detections = [] 
 
-    👉 Choose an option from the sidebar to start!
-    """)
+# ---------------- SIDEBAR ----------------
+st.sidebar.header("⚙️ Threshold Settings")
 
-elif st.session_state.source_mode == "webcam":
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        st.error("❌ Could not open webcam.")
-        st.session_state.source_mode = None
-    else:
-        process_video(cap)
+# ✅ SINGLE GLOBAL THRESHOLD (Applied to every zone individually)
+global_threshold = st.sidebar.slider(
+    "⚠️ Max People per Zone", 
+    min_value=1, max_value=50, value=5,
+    help="If ANY single zone exceeds this number, an alert is triggered for that zone."
+)
 
-elif st.session_state.source_mode == "video":
-    uploaded_file = st.file_uploader("Upload a video", type=["mp4", "avi"])
-    if uploaded_file:
-        tmp = tempfile.NamedTemporaryFile(delete=False)
-        tmp.write(uploaded_file.read())
-        cap = cv2.VideoCapture(tmp.name)
-        st.success("🎥 Video loaded.")
-        process_video(cap)
+st.sidebar.divider()
+st.sidebar.subheader("📡 Source")
+if st.sidebar.button("▶️ Start Webcam"): st.session_state.source_mode = "webcam"
+if st.sidebar.button("⏹️ Stop Webcam"): st.session_state.source_mode = None
+if st.sidebar.button("📁 Upload Video"): st.session_state.source_mode = "video"
+if st.sidebar.button("💾 Database Logs"): st.session_state.source_mode = "export"
+
+# ---------------- PROCESS FRAME ----------------
+def process_frame(frame, frame_count):
+    frame_h, frame_w = frame.shape[:2]
+    
+    # 1. SKIP FRAMES FOR SPEED (Run AI every 3rd frame)
+    if frame_count % FRAME_SKIP == 0:
+        small_frame = cv2.resize(frame, (640, 480))
+        results = detect_people(model, small_frame, conf=FIXED_CONFIDENCE)
+        
+        # Scale back
+        scale_x, scale_y = frame_w / 640, frame_h / 480
+        scaled_dets = []
+        for x1, y1, x2, y2, conf in results:
+            scaled_dets.append((int(x1*scale_x), int(y1*scale_y), int(x2*scale_x), int(y2*scale_y), conf))
+        st.session_state.last_detections = scaled_dets
+    
+    detections = st.session_state.last_detections
+    
+    # 2. Draw Grid & Calculate
+    draw_zone_grid(frame, GRID_ROWS, GRID_COLS)
+    zone_counts = [0] * (GRID_ROWS * GRID_COLS)
+    
+    for x1, y1, x2, y2, _ in detections:
+        xc, yc = (x1 + x2) // 2, (y1 + y2) // 2
+        if 0 <= xc < frame_w and 0 <= yc < frame_h:
+            z_id = get_zone_id(xc, yc, frame_w, frame_h, GRID_ROWS, GRID_COLS)
+            zone_counts[z_id] += 1
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.circle(frame, (xc, yc), 3, (0, 255, 0), -1)
+
+    # 3. CHECK ALERTS (Global Threshold applied per Zone)
+    for i, count in enumerate(zone_counts):
+        if count >= global_threshold:
+            # Visual Alert on Grid
+            r, c = i // GRID_COLS, i % GRID_COLS
+            zw, zh = frame_w // GRID_COLS, frame_h // GRID_ROWS
+            cv2.rectangle(frame, (c*zw, r*zh), ((c+1)*zw, (r+1)*zh), (0, 0, 255), 4)
+            cv2.putText(frame, f"ZONE {i} FULL!", (c*zw+10, r*zh+40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+
+            # Audio/DB Alert (Throttled 5s)
+            if time.time() - st.session_state.zone_beep_timers.get(i, 0) > 5:
+                msg = f"Zone {i} Critical: {count} People"
+                speak(f"Alert Zone {i}")
+                async_save_alert(i, count, msg)
+                st.session_state.zone_beep_timers[i] = time.time()
+
+    # 4. Log Data (Throttled)
+    if frame_count % FRAME_SKIP == 0:
+        async_save_log(zone_counts)
+
+    return frame, sum(zone_counts)
+
+# ---------------- MAIN LOOP ----------------
+if st.session_state.source_mode in ["webcam", "video"]:
+    c_vid, c_alert = st.columns([0.75, 0.25])
+    with c_vid: 
+        FRAME_WINDOW = st.empty()
+        METRICS = st.empty()
+    with c_alert: 
+        st.subheader("🚨 Live Alerts")
+        ALERTS = st.empty()
+
+    cap = cv2.VideoCapture(0) if st.session_state.source_mode == "webcam" else None
+    if st.session_state.source_mode == "video":
+        f = st.file_uploader("Upload Video", type=["mp4"])
+        if f: 
+            t = tempfile.NamedTemporaryFile(delete=False)
+            t.write(f.read())
+            cap = cv2.VideoCapture(t.name)
+
+    if cap and cap.isOpened():
+        cnt = 0
+        while cap.isOpened() and st.session_state.source_mode:
+            ret, frame = cap.read()
+            if not ret: break
+            if st.session_state.source_mode == "webcam": frame = cv2.flip(frame, 1)
+
+            frame, total = process_frame(frame, cnt)
+            cnt += 1
+
+            # Update UI
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            FRAME_WINDOW.image(frame, channels="RGB", use_container_width=True)
+            
+            if cnt % 5 == 0: # Update text less often
+                METRICS.metric("👥 Total Count", total)
+                recent = get_recent_alerts()
+                if not recent.empty:
+                    html = "".join([f"<div style='border-left:4px solid red; padding:5px; margin-bottom:5px; font-size:12px'><b>{r['timestamp'].split()[-1]}</b>: {r['message']}</div>" for _, r in recent.iterrows()])
+                    ALERTS.markdown(html, unsafe_allow_html=True)
+                else:
+                    ALERTS.info("All zones normal.")
+            time.sleep(0.001)
+        cap.release()
 
 elif st.session_state.source_mode == "export":
-    st.markdown("## 📊 Crowd Log Viewer")
-
-    if st.session_state.LOG:
-        df = pd.DataFrame(st.session_state.LOG)
-
-        with st.expander("📄 Raw Log Table"):
-            st.dataframe(df, use_container_width=True, height=300)
-
-        with st.expander("📈 Crowd Trend Graph"):
-            try:
-                df_numeric = df.copy()
-                df_numeric["timestamp"] = pd.to_datetime(df_numeric["timestamp"])
-                st.line_chart(df_numeric.set_index("timestamp"), height=300)
-            except Exception as e:
-                st.warning(f"Trend graph couldn't be rendered: {e}")
-
-        with st.expander("🔥 Heatmap of Last Frame"):
-            try:
-                last_counts = pd.to_numeric(df.iloc[-1].drop("timestamp"), errors='coerce').astype(float).values.reshape(GRID_ROWS, GRID_COLS)
-                fig1, ax1 = plt.subplots(figsize=(4, 3))
-                sns.heatmap(last_counts, annot=True, cmap="YlOrRd", cbar=True, ax=ax1)
-                st.pyplot(fig1)
-            except Exception as e:
-                st.warning(f"Heatmap render failed: {e}")
-
-        with st.expander("🔁 Cumulative Heatmap (Sum Over Time"):
-            try:
-                df_numeric = df.drop("timestamp", axis=1).apply(pd.to_numeric, errors="coerce")
-                sum_counts = df_numeric.sum().values.reshape(GRID_ROWS, GRID_COLS)
-                fig2, ax2 = plt.subplots(figsize=(4, 3))
-                sns.heatmap(sum_counts, annot=True, cmap="YlOrRd", cbar=True, ax=ax2)
-                st.pyplot(fig2)
-            except Exception as e:
-                st.warning(f"Cumulative heatmap failed: {e}")
-
-        with st.expander("📊 Average Heatmap (Mean Over Time"):
-            try:
-                avg_counts = df_numeric.mean().values.reshape(GRID_ROWS, GRID_COLS)
-                fig3, ax3 = plt.subplots(figsize=(4, 3))
-                sns.heatmap(avg_counts, annot=True, cmap="YlGnBu", cbar=True, ax=ax3)
-                st.pyplot(fig3)
-            except Exception as e:
-                st.warning(f"Average heatmap failed: {e}")
-
-        st.download_button(
-            "⬇️ Download Log as CSV",
-            df.to_csv(index=False),
-            file_name="crowd_log.csv",
-            mime="text/csv"
-        )
-    else:
-        st.info("No log data available yet. Try starting webcam or uploading a video.")
+    st.markdown("### 💾 Database Logs")
+    conn = sqlite3.connect(DB_NAME)
+    st.dataframe(pd.read_sql_query("SELECT * FROM logs ORDER BY timestamp DESC LIMIT 500", conn), use_container_width=True)
+    conn.close()
